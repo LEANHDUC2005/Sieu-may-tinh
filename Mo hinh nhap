@@ -1,0 +1,167 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import librosa
+import numpy as np
+import os
+import matplotlib.pyplot as plt
+from torch.utils.data import Dataset, DataLoader
+
+# Text Encoder (Embedding + CNN + Self-Attention)
+class TextEncoder(nn.Module):
+    def __init__(self, vocab_size, embedding_dim, hidden_dim, kernel_size, num_heads):
+        super(TextEncoder, self).__init__()
+        self.embedding = nn.Embedding(vocab_size, embedding_dim)
+        self.conv1d = nn.Conv1d(embedding_dim, hidden_dim, kernel_size=kernel_size, padding=kernel_size//2)
+        self.self_attention = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=num_heads)
+        self.relu = nn.ReLU()
+
+    def forward(self, x):
+        # Embed text input
+        x = self.embedding(x)
+        # Reshape for convolution
+        x = x.permute(0, 2, 1)  # (batch, seq_len, emb_dim) → (batch, emb_dim, seq_len)
+        x = self.conv1d(x)
+        x = self.relu(x)
+        x = x.permute(2, 0, 1)  # (batch, hidden_dim, seq_len) → (seq_len, batch, hidden_dim)
+        # Self-Attention
+        x, _ = self.self_attention(x, x, x)
+        return x
+
+# Mel Decoder (1D Convolutional Decoder)
+class MelDecoder(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim):
+        super(MelDecoder, self).__init__()
+        self.conv1d_1 = nn.Conv1d(input_dim, hidden_dim, kernel_size=3, stride=1, padding=1)
+        self.conv1d_2 = nn.Conv1d(hidden_dim, output_dim, kernel_size=3, stride=1, padding=1)
+        self.relu = nn.ReLU()
+
+    def forward(self, x):
+        x = self.relu(self.conv1d_1(x))
+        x = self.conv1d_2(x)
+        return x
+
+# HiFi-GAN Vocoder (Tái tạo sóng âm từ Mel Spectrogram)
+class HiFiGANVocoder(nn.Module):
+    def __init__(self):
+        super(HiFiGANVocoder, self).__init__()
+        self.conv1 = nn.Conv1d(80, 512, kernel_size=7, stride=1, padding=3)  # Chuyển từ Mel Spectrogram
+        self.residual_block = nn.Sequential(
+            nn.Conv1d(512, 512, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
+            nn.Conv1d(512, 512, kernel_size=3, stride=1, padding=1)
+        )
+        self.final_conv = nn.Conv1d(512, 1, kernel_size=7, stride=1, padding=3)  # Tạo ra sóng âm cuối cùng
+
+    def forward(self, mel_spec):
+        x = self.conv1(mel_spec)
+        x = self.residual_block(x)
+        audio_waveform = self.final_conv(x)
+        return audio_waveform
+
+#  Dataset (Audio và Text)
+class SpeechDataset(Dataset):
+    def __init__(self, audio_files, text_files, transform=None):
+        self.audio_files = audio_files
+        self.text_files = text_files
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.audio_files)
+
+    def __getitem__(self, idx):
+        audio_file = self.audio_files[idx]
+        text_file = self.text_files[idx]
+        
+        # Đọc âm thanh và tính Mel Spectrogram
+        y, sr = librosa.load(audio_file, sr=22050)
+        mel_spectrogram = librosa.feature.melspectrogram(y=y, sr=sr, n_mels=80)
+
+        # Đọc văn bản và chuyển thành vector
+        with open(text_file, 'r') as f:
+            text = f.read()
+        text_vector = np.array([ord(c) for c in text])  # Chuyển văn bản thành chuỗi số
+
+        sample = {'mel_spectrogram': mel_spectrogram, 'text_vector': text_vector}
+        return sample
+
+#  Hàm huấn luyện mô hình
+def train(model, dataloader, criterion, optimizer, num_epochs=10):
+    model.train()
+    for epoch in range(num_epochs):
+        total_loss = 0
+        for i, data in enumerate(dataloader):
+            mel_spectrogram, text_vector = data['mel_spectrogram'], data['text_vector']
+            mel_spectrogram = torch.tensor(mel_spectrogram, dtype=torch.float32)
+            text_vector = torch.tensor(text_vector, dtype=torch.long)
+            
+            # Tiến hành dự đoán
+            optimizer.zero_grad()
+            x = text_encoder(text_vector)  # Text Encoder
+            mel_output = mel_decoder(x)  # Mel Decoder
+            audio_output = vocoder(mel_output)  # Vocoder
+            
+            # Tính loss
+            loss = criterion(audio_output, mel_spectrogram)  # MSELoss or any suitable loss function
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item()
+
+        print(f'Epoch [{epoch+1}/{num_epochs}], Loss: {total_loss/len(dataloader):.4f}')
+
+# Hàm kiểm tra mô hình
+def test(model, dataloader):
+    model.eval()
+    with torch.no_grad():
+        for data in dataloader:
+            mel_spectrogram, text_vector = data['mel_spectrogram'], data['text_vector']
+            mel_spectrogram = torch.tensor(mel_spectrogram, dtype=torch.float32)
+            text_vector = torch.tensor(text_vector, dtype=torch.long)
+            
+            # Tiến hành dự đoán
+            x = text_encoder(text_vector)  # Text Encoder
+            mel_output = mel_decoder(x)  # Mel Decoder
+            audio_output = vocoder(mel_output)  # Vocoder
+
+            # Hiển thị Mel Spectrogram đầu ra
+            plt.imshow(audio_output[0].detach().numpy())
+            plt.title("Generated Audio Spectrogram")
+            plt.show()
+
+#  Hàm chính để chạy mô hình
+def main():
+    # Tạo dữ liệu mẫu (Cập nhật đúng đường dẫn dữ liệu âm thanh và văn bản)
+    audio_files = ['data/audio1.wav', 'data/audio2.wav']
+    text_files = ['data/text1.txt', 'data/text2.txt']
+    
+    # Tạo dataset và dataloader
+    dataset = SpeechDataset(audio_files, text_files)
+    dataloader = DataLoader(dataset, batch_size=2, shuffle=True)
+
+    # Khởi tạo mô hình
+    vocab_size = 128  # Tối thiểu cho ASCII (hoặc có thể lớn hơn)
+    embedding_dim = 256
+    hidden_dim = 512
+    kernel_size = 5
+    num_heads = 8
+
+    global text_encoder, mel_decoder, vocoder
+    text_encoder = TextEncoder(vocab_size, embedding_dim, hidden_dim, kernel_size, num_heads)
+    mel_decoder = MelDecoder(hidden_dim, hidden_dim, 80)  # 80 là số lượng Mel bins
+    vocoder = HiFiGANVocoder()
+
+    model = nn.Sequential(text_encoder, mel_decoder, vocoder)
+
+    # Cài đặt tiêu chí và tối ưu hóa
+    criterion = nn.MSELoss()
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
+
+    # Huấn luyện mô hình
+    train(model, dataloader, criterion, optimizer, num_epochs=10)
+
+    # Kiểm tra mô hình
+    test(model, dataloader)
+
+if __name__ == "__main__":
+    main()
